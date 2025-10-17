@@ -1,7 +1,8 @@
 import { VoiceSession, ControlMessage, VoiceMetrics } from '@/types/voice';
+import { io, Socket } from 'socket.io-client';
 
 export class VoiceService {
-  private ws: WebSocket | null = null;
+  private socket: Socket | null = null;
   private audioContext: AudioContext | null = null;
   private mediaStream: MediaStream | null = null;
   private mediaRecorder: MediaRecorder | null = null;
@@ -44,36 +45,61 @@ export class VoiceService {
   async connect(session: VoiceSession): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
-        this.ws = new WebSocket(session.wsUrl);
-        this.ws.binaryType = 'arraybuffer';
+        // Parse the WebSocket URL to get the base URL and query params
+        const wsUrl = session.wsUrl.replace('ws://', 'http://');
+        const url = new URL(wsUrl);
+        const baseUrl = `${url.protocol}//${url.host}`;
+        const namespace = url.pathname;
+        const query = Object.fromEntries(url.searchParams);
 
-        this.ws.onopen = () => {
-          console.log('WebSocket connected');
+        console.log('Connecting to Socket.io:', { baseUrl, namespace, query });
+
+        // Create Socket.io connection
+        this.socket = io(baseUrl + namespace, {
+          query,
+          transports: ['websocket', 'polling'],
+          reconnectionAttempts: this.maxReconnectAttempts,
+          reconnectionDelay: this.reconnectDelay,
+          upgrade: true,
+          rememberUpgrade: true,
+        });
+
+        // Connection event handlers
+        this.socket.on('connect', () => {
+          console.log('Socket.io connected');
           this.reconnectAttempts = 0;
           resolve();
-        };
+        });
 
-        this.ws.onmessage = async (event) => {
-          if (typeof event.data === 'string') {
-            // Control message
-            const message: ControlMessage = JSON.parse(event.data);
-            this.handleControlMessage(message);
-          } else {
-            // Audio data
-            await this.handleAudioData(event.data);
-          }
-        };
+        // Listen for control messages
+        this.socket.on('control', (message: ControlMessage) => {
+          this.handleControlMessage(message);
+        });
 
-        this.ws.onerror = (error) => {
-          console.error('WebSocket error:', error);
+        // Listen for audio data
+        this.socket.on('audio', async (data: ArrayBuffer) => {
+          await this.handleAudioData(data);
+        });
+
+        // Error handling
+        this.socket.on('error', (error: any) => {
+          console.error('Socket.io error:', error);
+          this.onError?.(error.message || 'Socket connection error');
+        });
+
+        this.socket.on('connect_error', (error) => {
+          console.error('Socket.io connection error:', error);
           this.onError?.('WebSocket connection error');
           reject(error);
-        };
+        });
 
-        this.ws.onclose = () => {
-          console.log('WebSocket closed');
-          this.handleDisconnect(session);
-        };
+        this.socket.on('disconnect', (reason) => {
+          console.log('Socket.io disconnected:', reason);
+          if (reason === 'io server disconnect') {
+            // Server initiated disconnect, try to reconnect
+            this.handleDisconnect(session);
+          }
+        });
       } catch (error) {
         reject(error);
       }
@@ -111,11 +137,31 @@ export class VoiceService {
     }
   }
 
-  private async handleAudioData(data: ArrayBuffer): Promise<void> {
+  private async handleAudioData(data: any): Promise<void> {
     if (!this.audioContext) return;
 
     try {
-      const audioBuffer = await this.audioContext.decodeAudioData(data.slice(0));
+      // Convert data to ArrayBuffer if needed
+      let arrayBuffer: ArrayBuffer;
+      
+      if (data instanceof ArrayBuffer) {
+        arrayBuffer = data;
+      } else if (data instanceof Uint8Array) {
+        arrayBuffer = data.buffer;
+      } else if (typeof data === 'object' && data.type === 'Buffer' && Array.isArray(data.data)) {
+        // Socket.io sends Buffer as { type: 'Buffer', data: [...] }
+        arrayBuffer = new Uint8Array(data.data).buffer;
+      } else if (ArrayBuffer.isView(data)) {
+        arrayBuffer = data.buffer;
+      } else {
+        console.error('Unknown audio data format:', typeof data, data);
+        return;
+      }
+
+      console.log('Received audio data:', arrayBuffer.byteLength, 'bytes');
+
+      // Decode audio data (MP3 from ElevenLabs)
+      const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer.slice(0));
       this.audioQueue.push(audioBuffer);
 
       // Extract audio data for visualization
@@ -127,6 +173,43 @@ export class VoiceService {
       }
     } catch (error) {
       console.error('Error decoding audio:', error);
+      console.error('Audio data type:', typeof data);
+      console.error('Audio data:', data);
+      
+      // Try alternative playback method using HTML5 Audio
+      this.playAudioFallback(data);
+    }
+  }
+
+  private playAudioFallback(data: any): void {
+    try {
+      // Convert to Blob and play with HTML5 Audio
+      let blob: Blob;
+      
+      if (data instanceof ArrayBuffer) {
+        blob = new Blob([data], { type: 'audio/mpeg' });
+      } else if (typeof data === 'object' && data.type === 'Buffer' && Array.isArray(data.data)) {
+        const uint8Array = new Uint8Array(data.data);
+        blob = new Blob([uint8Array], { type: 'audio/mpeg' });
+      } else {
+        console.error('Cannot create audio blob from data');
+        return;
+      }
+
+      const audio = new Audio(URL.createObjectURL(blob));
+      audio.play().then(() => {
+        console.log('Fallback audio playback started');
+      }).catch(err => {
+        console.error('Fallback audio playback failed:', err);
+        this.onError?.('Failed to play audio');
+      });
+
+      // Cleanup blob URL after playing
+      audio.onended = () => {
+        URL.revokeObjectURL(audio.src);
+      };
+    } catch (error) {
+      console.error('Fallback audio playback error:', error);
     }
   }
 
@@ -170,9 +253,9 @@ export class VoiceService {
       });
 
       this.mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0 && this.ws?.readyState === WebSocket.OPEN) {
+        if (event.data.size > 0 && this.socket?.connected) {
           event.data.arrayBuffer().then((buffer) => {
-            this.ws?.send(buffer);
+            this.socket?.emit('audio', buffer);
           });
         }
       };
@@ -201,13 +284,11 @@ export class VoiceService {
   }
 
   sendControlMessage(type: string, data: any): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(
-        JSON.stringify({
-          type,
-          data,
-        })
-      );
+    if (this.socket?.connected) {
+      this.socket.emit('control', {
+        type,
+        data,
+      });
     }
   }
 
@@ -254,9 +335,9 @@ export class VoiceService {
     this.stopRecording();
     this.stopPlayback();
 
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
+    if (this.socket) {
+      this.socket.disconnect();
+      this.socket = null;
     }
 
     if (this.audioContext) {

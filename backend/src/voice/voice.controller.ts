@@ -35,7 +35,7 @@ export class VoiceController {
 
       return {
         sessionId: session.sessionId,
-        wsUrl: `ws://localhost:${port}/ws/voice/${session.sessionId}`,
+        wsUrl: `ws://localhost:${port}/voice?sessionId=${session.sessionId}`,
         token,
       };
     } catch (error) {

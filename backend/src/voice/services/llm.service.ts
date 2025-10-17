@@ -34,7 +34,15 @@ export class LlmService {
     context: ConversationContext,
   ): Promise<IntentResult> {
     if (!this.openai) {
-      throw new Error('OpenAI client not initialized. Check API key.');
+      this.logger.warn('OpenAI client not initialized. Check API key. Using fallback responses.');
+      // Return a fallback response for testing
+      const intent = this.extractIntent(userInput, context);
+      return {
+        intent,
+        response: this.getFallbackResponse(intent, context),
+        data: this.extractData(userInput, intent, context),
+        needsClarification: this.checkNeedsClarification(userInput, context),
+      };
     }
 
     const systemPrompt = this.buildSystemPrompt(context);
@@ -68,6 +76,30 @@ export class LlmService {
     } catch (error) {
       this.logger.error('LLM processing error:', error);
       throw error;
+    }
+  }
+
+  private getFallbackResponse(intent: string, context: ConversationContext): string {
+    switch (context.step) {
+      case 'greeting':
+        return "Hi, I'm your support assistant. What product are you calling about today?";
+      case 'collecting':
+        if (!context.product) {
+          return "What product do you need help with?";
+        }
+        if (!context.issue) {
+          return "Can you describe the issue you're experiencing?";
+        }
+        if (!context.urgency) {
+          return "How urgent is this issue: low, medium, or high?";
+        }
+        return "Thank you for providing that information.";
+      case 'confirming':
+        return `I've recorded your information for ${context.product}. Would you like to submit this ticket?`;
+      case 'complete':
+        return "Thank you! Is there anything else I can help you with?";
+      default:
+        return "I'm here to help you create a support ticket. What can I assist you with?";
     }
   }
 

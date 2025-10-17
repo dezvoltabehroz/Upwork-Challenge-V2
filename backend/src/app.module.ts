@@ -10,6 +10,8 @@ import configuration from './config/configuration';
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
+      envFilePath: '.env',
+      ignoreEnvFile: false,
       load: [configuration],
     }),
     JwtModule.register({

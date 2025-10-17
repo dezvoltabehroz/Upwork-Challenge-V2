@@ -7,26 +7,35 @@ import {
   MessageBody,
   ConnectedSocket,
 } from '@nestjs/websockets';
-import { Server, WebSocket as WsWebSocket } from 'ws';
+import { Server, Socket } from 'socket.io';
 import { Logger } from '@nestjs/common';
 import { OrchestratorService } from './services/orchestrator.service';
 import { TtsService } from './services/tts.service';
 
-type ExtendedWebSocket = WsWebSocket & {
-  sessionId?: string;
-  isAlive?: boolean;
+interface SocketData {
+  sessionId: string;
+}
+
+type ExtendedSocket = Socket & {
+  data: SocketData;
 }
 
 @WebSocketGateway({
-  path: '/ws/voice',
-  transports: ['websocket'],
+  namespace: '/voice',
+  cors: {
+    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+    credentials: true,
+  },
+  transports: ['websocket', 'polling'],
+  maxHttpBufferSize: 1e8, // 100 MB
+  pingTimeout: 60000,
 })
 export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server: Server;
 
   private readonly logger = new Logger(VoiceGateway.name);
-  private clients: Map<string, ExtendedWebSocket> = new Map();
+  private clients: Map<string, ExtendedSocket> = new Map();
 
   constructor(
     private orchestratorService: OrchestratorService,
@@ -38,26 +47,27 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }, 300000);
   }
 
-  async handleConnection(client: ExtendedWebSocket, request: any) {
-    const url = new URL(request.url, `ws://${request.headers.host}`);
-    const pathParts = url.pathname.split('/');
-    const sessionId = pathParts[pathParts.length - 1];
+  async handleConnection(client: ExtendedSocket) {
+    // Get sessionId from query parameters
+    const sessionId = client.handshake.query.sessionId as string;
 
     if (!sessionId) {
       this.logger.error('No session ID provided');
-      client.close(1008, 'Session ID required');
+      client.emit('error', { message: 'Session ID required' });
+      client.disconnect();
       return;
     }
 
     const session = this.orchestratorService.getSession(sessionId);
     if (!session) {
       this.logger.error(`Session not found: ${sessionId}`);
-      client.close(1008, 'Invalid session');
+      client.emit('error', { message: 'Invalid session' });
+      client.disconnect();
       return;
     }
 
-    client.sessionId = sessionId;
-    client.isAlive = true;
+    // Store session ID in socket data
+    client.data = { sessionId };
     this.clients.set(sessionId, client);
 
     this.logger.log(`Client connected to session: ${sessionId}`);
@@ -77,11 +87,16 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
         timestamp: Date.now(),
       });
 
-      // Stream audio
+      // Collect all audio chunks first
+      const audioChunks: Buffer[] = [];
       for await (const chunk of audioStream) {
-        if (client.readyState === 1) {
-          client.send(chunk);
-        }
+        audioChunks.push(Buffer.from(chunk));
+      }
+      
+      // Send complete audio buffer
+      if (client.connected && audioChunks.length > 0) {
+        const completeAudio = Buffer.concat(audioChunks);
+        client.emit('audio', completeAudio);
       }
 
       // Send audio end marker
@@ -90,32 +105,12 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
       });
     } catch (error) {
       this.logger.error('Error sending greeting:', error);
+      client.emit('error', { message: 'Failed to send greeting' });
     }
-
-    // Setup heartbeat
-    const heartbeatInterval = setInterval(() => {
-      if (client.isAlive === false) {
-        clearInterval(heartbeatInterval);
-        return client.terminate();
-      }
-
-      client.isAlive = false;
-      if (client.readyState === 1) {
-        client.ping();
-      }
-    }, 30000);
-
-    client.on('pong', () => {
-      client.isAlive = true;
-    });
-
-    client.on('close', () => {
-      clearInterval(heartbeatInterval);
-    });
   }
 
-  async handleDisconnect(client: ExtendedWebSocket) {
-    const sessionId = client.sessionId;
+  async handleDisconnect(client: ExtendedSocket) {
+    const sessionId = client.data?.sessionId;
 
     if (sessionId) {
       this.clients.delete(sessionId);
@@ -126,10 +121,10 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('audio')
   async handleAudioChunk(
-    @ConnectedSocket() client: ExtendedWebSocket,
+    @ConnectedSocket() client: ExtendedSocket,
     @MessageBody() data: any,
   ) {
-    const sessionId = client.sessionId;
+    const sessionId = client.data?.sessionId;
 
     if (!sessionId) {
       this.logger.error('No session ID for audio chunk');
@@ -151,10 +146,10 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('control')
   async handleControlMessage(
-    @ConnectedSocket() client: ExtendedWebSocket,
+    @ConnectedSocket() client: ExtendedSocket,
     @MessageBody() message: any,
   ) {
-    const sessionId = client.sessionId;
+    const sessionId = client.data?.sessionId;
 
     if (!sessionId) {
       return;
@@ -190,16 +185,15 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   private sendControlMessage(
-    client: ExtendedWebSocket,
+    client: ExtendedSocket,
     type: string,
     data: any,
   ): void {
-    if (client.readyState === 1) {
-      const message = JSON.stringify({
+    if (client.connected) {
+      client.emit('control', {
         type,
         data,
       });
-      client.send(message);
     }
   }
 
@@ -207,7 +201,7 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
   async sendResponse(sessionId: string, text: string): Promise<void> {
     const client = this.clients.get(sessionId);
 
-    if (!client || client.readyState !== 1) {
+    if (!client || !client.connected) {
       this.logger.warn(`Cannot send response to session ${sessionId}`);
       return;
     }
@@ -222,10 +216,16 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
       // Generate and stream audio
       const audioStream = await this.ttsService.synthesizeSpeechStreaming(text);
 
+      // Collect all audio chunks first
+      const audioChunks: Buffer[] = [];
       for await (const chunk of audioStream) {
-        if (client.readyState === 1) {
-          client.send(chunk);
-        }
+        audioChunks.push(Buffer.from(chunk));
+      }
+      
+      // Send complete audio buffer
+      if (client.connected && audioChunks.length > 0) {
+        const completeAudio = Buffer.concat(audioChunks);
+        client.emit('audio', completeAudio);
       }
 
       // Send audio end marker

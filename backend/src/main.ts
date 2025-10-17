@@ -1,6 +1,6 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
-import { WsAdapter } from '@nestjs/platform-ws';
+import { IoAdapter } from '@nestjs/platform-socket.io';
 import { ValidationPipe } from '@nestjs/common';
 
 async function bootstrap() {
@@ -12,8 +12,9 @@ async function bootstrap() {
     credentials: true,
   });
 
-  // Enable WebSocket adapter
-  app.useWebSocketAdapter(new WsAdapter(app));
+  // Enable Socket.IO adapter with CORS and binary support
+  const ioAdapter = new IoAdapter(app);
+  app.useWebSocketAdapter(ioAdapter);
 
   // Enable validation
   app.useGlobalPipes(
