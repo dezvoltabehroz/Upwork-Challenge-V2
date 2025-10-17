@@ -13,7 +13,8 @@ export interface ConversationContext {
   product?: string;
   issue?: string;
   urgency?: 'low' | 'medium' | 'high';
-  step: 'greeting' | 'collecting' | 'clarifying' | 'confirming' | 'complete';
+  ticketId?: string;
+  step: 'greeting' | 'collect_issue' | 'collect_urgency' | 'confirming' | 'complete';
   conversationHistory: Array<{ role: string; content: string }>;
 }
 
@@ -54,7 +55,7 @@ export class LlmService {
 
     try {
       const completion = await this.openai.chat.completions.create({
-        model: 'gpt-4-turbo-preview',
+        model: 'gpt-3.5-turbo',  // Changed from gpt-4-turbo-preview to gpt-3.5-turbo (more widely available)
         messages: messages as any,
         temperature: 0.7,
         max_tokens: 150,
@@ -75,7 +76,16 @@ export class LlmService {
       };
     } catch (error) {
       this.logger.error('LLM processing error:', error);
-      throw error;
+      this.logger.warn('Falling back to template-based responses');
+      
+      // Fall back to template-based responses on error
+      const intent = this.extractIntent(userInput, context);
+      return {
+        intent,
+        response: this.getFallbackResponse(intent, context),
+        data: this.extractData(userInput, intent, context),
+        needsClarification: this.checkNeedsClarification(userInput, context),
+      };
     }
   }
 
@@ -83,43 +93,61 @@ export class LlmService {
     switch (context.step) {
       case 'greeting':
         return "Hi, I'm your support assistant. What product are you calling about today?";
-      case 'collecting':
-        if (!context.product) {
-          return "What product do you need help with?";
+      
+      case 'collect_issue':
+        if (context.product) {
+          return `Got it, the ${context.product}. What issue are you experiencing?`;
         }
-        if (!context.issue) {
-          return "Can you describe the issue you're experiencing?";
+        return "What issue are you experiencing?";
+      
+      case 'collect_urgency':
+        if (context.issue) {
+          return `I understand - ${context.issue}. How urgent is this for you - low, medium, or high?`;
         }
-        if (!context.urgency) {
-          return "How urgent is this issue: low, medium, or high?";
-        }
-        return "Thank you for providing that information.";
+        return "How urgent is this for you - low, medium, or high?";
+      
       case 'confirming':
-        return `I've recorded your information for ${context.product}. Would you like to submit this ticket?`;
+        if (context.ticketId && context.product && context.issue && context.urgency) {
+          return `I've created ticket #${context.ticketId} for the ${context.product} ${context.issue} with ${context.urgency} priority. Should I submit this now?`;
+        }
+        return "Should I submit this ticket?";
+      
       case 'complete':
-        return "Thank you! Is there anything else I can help you with?";
+        if (context.urgency === 'high') {
+          return "Perfect! Your ticket has been submitted. Our team will contact you within 2 hours for high priority issues.";
+        } else if (context.urgency === 'medium') {
+          return "Perfect! Your ticket has been submitted. Our team will contact you within 24 hours for medium priority issues.";
+        } else {
+          return "Perfect! Your ticket has been submitted. Our team will contact you within 48 hours for low priority issues.";
+        }
+      
       default:
         return "I'm here to help you create a support ticket. What can I assist you with?";
     }
   }
 
   private buildSystemPrompt(context: ConversationContext): string {
-    return `You are a helpful support assistant helping users create support tickets via voice conversation.
+    return `You are a support assistant helping users create support tickets via voice conversation.
 
 Current context:
 - Product: ${context.product || 'not provided'}
 - Issue: ${context.issue || 'not provided'}
 - Urgency: ${context.urgency || 'not provided'}
+- Ticket ID: ${context.ticketId || 'not generated'}
 - Current step: ${context.step}
 
-Your role:
-1. If greeting: Welcome the user and ask about the product.
-2. If collecting: Ask for missing information (product, issue description, urgency).
-3. If clarifying: Ask clarifying questions if information is unclear.
-4. If confirming: Summarize the ticket and ask for confirmation.
-5. If complete: Provide final confirmation.
+Conversation flow:
+1. greeting: Ask "What product are you calling about today?"
+2. collect_issue: Acknowledge product, then ask "What issue are you experiencing?"
+3. collect_urgency: Acknowledge issue, then ask "How urgent is this for you - low, medium, or high?"
+4. confirming: Create ticket, provide ticket number, ask for confirmation
+5. complete: Confirm submission and provide SLA
 
-Keep responses concise and natural for voice interaction. Ask one question at a time.`;
+Rules:
+- Keep responses natural and conversational for voice
+- Acknowledge what the user said before asking the next question
+- Be concise - aim for 1-2 sentences per response
+- Use exact phrasing from the flow above when possible`;
   }
 
   private extractIntent(
@@ -128,16 +156,24 @@ Keep responses concise and natural for voice interaction. Ask one question at a 
   ): string {
     const lowerInput = userInput.toLowerCase();
 
-    if (lowerInput.includes('yes') || lowerInput.includes('correct')) {
-      return 'confirm';
+    // Handle confirmation step
+    if (context.step === 'confirming') {
+      if (lowerInput.includes('yes') || lowerInput.includes('please') || lowerInput.includes('submit')) {
+        return 'confirm';
+      }
+      if (lowerInput.includes('no') || lowerInput.includes('cancel')) {
+        return 'reject';
+      }
+      return 'confirm'; // Default to confirm if unclear
     }
-    if (lowerInput.includes('no') || lowerInput.includes('cancel')) {
-      return 'reject';
-    }
+
+    // Handle urgency
     if (
-      lowerInput.includes('low') ||
-      lowerInput.includes('medium') ||
-      lowerInput.includes('high')
+      context.step === 'collect_urgency' &&
+      (lowerInput.includes('low') ||
+        lowerInput.includes('medium') ||
+        lowerInput.includes('high') ||
+        lowerInput.includes('urgent'))
     ) {
       return 'urgency';
     }
@@ -145,12 +181,10 @@ Keep responses concise and natural for voice interaction. Ask one question at a 
     switch (context.step) {
       case 'greeting':
         return 'provide_product';
-      case 'collecting':
-        return context.product ? 'provide_issue' : 'provide_product';
-      case 'clarifying':
-        return 'clarification_response';
-      case 'confirming':
-        return 'confirmation_response';
+      case 'collect_issue':
+        return 'provide_issue';
+      case 'collect_urgency':
+        return 'urgency';
       default:
         return 'unknown';
     }
@@ -164,29 +198,56 @@ Keep responses concise and natural for voice interaction. Ask one question at a 
     const data: any = {};
 
     if (intent === 'provide_product' && !context.product) {
-      data.product = userInput.trim();
+      // Extract product name, clean up common filler words
+      let product = userInput.trim()
+        .replace(/^(um|uh|the|a|an)\s+/i, '')
+        .replace(/\s+(um|uh)$/i, '')
+        .trim();
+      data.product = product;
     }
 
     if (intent === 'provide_issue' && !context.issue) {
-      data.issue = userInput.trim();
+      // Clean up and extract issue description
+      let issue = userInput.trim()
+        .replace(/^(it|the app|it's)\s+/i, '')
+        .trim();
+      data.issue = issue;
     }
 
     if (intent === 'urgency') {
       const lowerInput = userInput.toLowerCase();
-      if (lowerInput.includes('high')) data.urgency = 'high';
-      else if (lowerInput.includes('medium')) data.urgency = 'medium';
-      else if (lowerInput.includes('low')) data.urgency = 'low';
+      if (lowerInput.includes('high') || lowerInput.includes('urgent') || lowerInput.includes('very')) {
+        data.urgency = 'high';
+      } else if (lowerInput.includes('medium') || lowerInput.includes('moderate')) {
+        data.urgency = 'medium';
+      } else if (lowerInput.includes('low') || lowerInput.includes('not urgent')) {
+        data.urgency = 'low';
+      } else {
+        // Default to medium if unclear
+        data.urgency = 'medium';
+      }
+      
+      // Generate ticket ID when urgency is set
+      if (data.urgency) {
+        data.ticketId = this.generateTicketId();
+      }
     }
 
     return data;
+  }
+
+  private generateTicketId(): string {
+    // Generate ticket ID in format T-XXXX
+    const randomNum = Math.floor(1000 + Math.random() * 9000);
+    return `T-${randomNum}`;
   }
 
   private checkNeedsClarification(
     userInput: string,
     context: ConversationContext,
   ): boolean {
-    // Check if input is too short or vague
-    if (userInput.trim().split(' ').length < 3 && context.step === 'collecting') {
+    // Check if input is too short or vague for issue description
+    if (userInput.trim().split(' ').length < 3 && context.step === 'collect_issue') {
       return true;
     }
 

@@ -34,14 +34,20 @@ export class SttService extends EventEmitter {
       };
     }
 
-    const model = this.configService.get<string>('voice.deepgram.model');
+    const model = this.configService.get<string>('voice.deepgram.model') || 'nova-2';
+    
+    this.logger.log(`Creating Deepgram connection with model: ${model}`);
+    
     const connection = this.deepgram.listen.live({
       model,
       language: 'en',
       smart_format: true,
       interim_results: true,
       punctuate: true,
-      endpointing: 300,
+      endpointing: 500,  // Wait 500ms of silence before finalizing (increased from 300)
+      utterance_end_ms: 1500,  // Consider utterance ended after 1.5s of silence
+      vad_events: true,  // Enable voice activity detection events
+      // Let Deepgram auto-detect encoding from webm format
     });
 
     connection.on(LiveTranscriptionEvents.Open, () => {

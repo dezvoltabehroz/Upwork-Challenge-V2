@@ -41,6 +41,9 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private orchestratorService: OrchestratorService,
     private ttsService: TtsService,
   ) {
+    // Register this gateway with orchestrator to handle responses
+    this.orchestratorService.setGateway(this);
+    
     // Cleanup inactive sessions every 5 minutes
     setInterval(() => {
       this.orchestratorService.cleanupInactiveSessions();
@@ -193,6 +196,32 @@ export class VoiceGateway implements OnGatewayConnection, OnGatewayDisconnect {
       client.emit('control', {
         type,
         data,
+      });
+    }
+  }
+
+  // Public method for orchestrator to send interim transcripts
+  sendInterimTranscript(sessionId: string, text: string): void {
+    const client = this.clients.get(sessionId);
+    
+    if (client && client.connected) {
+      this.sendControlMessage(client, 'transcript', {
+        text,
+        isFinal: false,
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  // Public method for orchestrator to send final transcripts
+  sendFinalTranscript(sessionId: string, text: string): void {
+    const client = this.clients.get(sessionId);
+    
+    if (client && client.connected) {
+      this.sendControlMessage(client, 'transcript', {
+        text,
+        isFinal: true,
+        timestamp: Date.now(),
       });
     }
   }
